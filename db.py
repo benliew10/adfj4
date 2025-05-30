@@ -556,3 +556,187 @@ def delete_image_by_number(number: int, group_b_id: int) -> bool:
     except Exception as e:
         logger.error(f"Database error in delete_image_by_number: {e}")
         return False 
+
+def get_next_open_image_ascending() -> Optional[Dict]:
+    """Get the next open image in ascending order by number."""
+    try:
+        init_db()  # Make sure the database exists
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Check if metadata column exists
+        cursor.execute("PRAGMA table_info(images)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'metadata' in columns:
+            cursor.execute("SELECT image_id, number, file_id, status, metadata FROM images WHERE status = 'open' ORDER BY number ASC")
+        else:
+            cursor.execute("SELECT image_id, number, file_id, status FROM images WHERE status = 'open' ORDER BY number ASC")
+        
+        rows = cursor.fetchall()
+        
+        if not rows:
+            logger.info("No open images available")
+            conn.close()
+            return None
+        
+        # Get the first image (lowest number)
+        row = rows[0]
+        
+        image = {
+            'image_id': row[0],
+            'number': row[1],
+            'file_id': row[2],
+            'status': row[3]
+        }
+        
+        # Add metadata if available
+        if 'metadata' in columns and len(row) > 4 and row[4]:
+            try:
+                image['metadata'] = json.loads(row[4])
+            except (ValueError, TypeError, json.JSONDecodeError) as e:
+                logger.error(f"Error parsing metadata for image {row[0]}: {e}")
+                image['metadata'] = {}
+        
+        conn.close()
+        return image
+    except Exception as e:
+        logger.error(f"Error getting next open image in ascending order: {e}")
+        return None 
+
+def get_next_open_image_ascending_with_percentage(group_b_percentages: Dict = None) -> Optional[Dict]:
+    """Get the next open image in ascending order by number, considering Group B percentages as priority."""
+    try:
+        init_db()  # Make sure the database exists
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Check if metadata column exists
+        cursor.execute("PRAGMA table_info(images)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'metadata' in columns:
+            cursor.execute("SELECT image_id, number, file_id, status, metadata FROM images WHERE status = 'open' ORDER BY number ASC")
+        else:
+            cursor.execute("SELECT image_id, number, file_id, status FROM images WHERE status = 'open' ORDER BY number ASC")
+        
+        rows = cursor.fetchall()
+        
+        if not rows:
+            logger.info("No open images available")
+            conn.close()
+            return None
+        
+        # If no percentage settings, return first image
+        if not group_b_percentages:
+            row = rows[0]
+            image = {
+                'image_id': row[0],
+                'number': row[1],
+                'file_id': row[2],
+                'status': row[3]
+            }
+            
+            # Add metadata if available
+            if 'metadata' in columns and len(row) > 4 and row[4]:
+                try:
+                    image['metadata'] = json.loads(row[4])
+                except (ValueError, TypeError, json.JSONDecodeError) as e:
+                    logger.error(f"Error parsing metadata for image {row[0]}: {e}")
+                    image['metadata'] = {}
+            
+            conn.close()
+            return image
+        
+        # PRIORITY SYSTEM: First, try to find images from 100% Group Bs (highest priority)
+        priority_images = []
+        high_percentage_images = []
+        normal_images = []
+        
+        for row in rows:
+            image = {
+                'image_id': row[0],
+                'number': row[1],
+                'file_id': row[2],
+                'status': row[3]
+            }
+            
+            # Add metadata if available
+            if 'metadata' in columns and len(row) > 4 and row[4]:
+                try:
+                    image['metadata'] = json.loads(row[4])
+                except (ValueError, TypeError, json.JSONDecodeError) as e:
+                    logger.error(f"Error parsing metadata for image {row[0]}: {e}")
+                    image['metadata'] = {}
+            else:
+                image['metadata'] = {}
+            
+            # Check if this image has Group B metadata
+            metadata = image.get('metadata', {})
+            if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
+                try:
+                    source_group_b_id = int(metadata['source_group_b_id'])
+                    
+                    # Check percentage setting for this Group B
+                    if source_group_b_id in group_b_percentages:
+                        percentage = group_b_percentages[source_group_b_id]
+                        
+                        if percentage == 100:
+                            # 100% = Highest priority - these should be sent first
+                            priority_images.append(image)
+                            logger.info(f"Image {image['image_id']} from Group B {source_group_b_id} has 100% priority")
+                        elif percentage >= 50:
+                            # High percentage images
+                            high_percentage_images.append((image, percentage))
+                        else:
+                            # Lower percentage images
+                            normal_images.append((image, percentage))
+                    else:
+                        # No specific percentage setting, treat as normal
+                        normal_images.append((image, 100))  # Default 100% if not specified
+                        
+                except (ValueError, TypeError) as e:
+                    logger.error(f"Error processing metadata for image {row[0]}: {e}")
+                    normal_images.append((image, 100))  # Default if error
+            else:
+                # No metadata or no Group B ID, treat as normal
+                normal_images.append((image, 100))  # Default 100%
+        
+        # Return images by priority:
+        # 1. First, return any 100% priority images (in ascending order)
+        if priority_images:
+            selected_image = priority_images[0]  # Already sorted by number ASC
+            logger.info(f"Selected priority image: {selected_image['image_id']} (100% priority)")
+            conn.close()
+            return selected_image
+        
+        # 2. Then try high percentage images (with chance)
+        if high_percentage_images:
+            import random
+            for image, percentage in high_percentage_images:
+                random_chance = random.randint(1, 100)
+                logger.info(f"Image {image['image_id']} has {percentage}% chance, rolled {random_chance}")
+                if random_chance <= percentage:
+                    logger.info(f"Selected high percentage image: {image['image_id']}")
+                    conn.close()
+                    return image
+        
+        # 3. Finally try normal/lower percentage images
+        if normal_images:
+            import random
+            for image, percentage in normal_images:
+                random_chance = random.randint(1, 100)
+                logger.info(f"Image {image['image_id']} has {percentage}% chance, rolled {random_chance}")
+                if random_chance <= percentage:
+                    logger.info(f"Selected normal image: {image['image_id']}")
+                    conn.close()
+                    return image
+        
+        # If we get here, all images were skipped due to percentage, return None
+        logger.info("All open images were skipped due to percentage restrictions")
+        conn.close()
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error getting next open image with percentage: {e}")
+        return None 

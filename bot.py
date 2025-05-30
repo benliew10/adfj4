@@ -3,6 +3,7 @@ import os
 import re
 import json
 import time
+import random
 from typing import Dict, Optional, List, Any
 from datetime import datetime
 
@@ -19,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Bot token from environment variable
-TOKEN = "7112020834:AAFkIr-JRzErmsHg4YOXjXPJpypJu0vE7pw"
+TOKEN = os.getenv("BOT_TOKEN", "8087490170:AAGkIL_s_NywMN0z6uyx7Jty6r66Ej9SfS0")
 
 # Group IDs
 # Moving from single group to multiple groups
@@ -51,6 +52,7 @@ GROUP_B_IDS_FILE = "group_b_ids.json"
 GROUP_ADMINS_FILE = "group_admins.json"
 PENDING_CUSTOM_AMOUNTS_FILE = "pending_custom_amounts.json"
 SETTINGS_FILE = "bot_settings.json"
+GROUP_B_PERCENTAGES_FILE = "group_b_percentages.json"
 
 # Message IDs mapping for forwarded messages
 forwarded_msgs: Dict[str, Dict] = {}
@@ -63,6 +65,9 @@ pending_requests: Dict[int, Dict] = {}
 
 # Store pending custom amount approvals from Group B
 pending_custom_amounts: Dict[int, Dict] = {}  # Format: {message_id: {img_id, amount, responder, original_msg_id}}
+
+# Store Group B percentage settings for image distribution
+group_b_percentages: Dict[int, int] = {}  # Format: {group_b_id: percentage}
 
 # Function to safely send messages with retry logic
 def safe_send_message(context, chat_id, text, reply_to_message_id=None, max_retries=3, retry_delay=2):
@@ -142,11 +147,19 @@ def save_config_data():
             logger.info(f"Saved bot settings to file")
     except Exception as e:
         logger.error(f"Error saving bot settings: {e}")
+    
+    # Save Group B Percentages
+    try:
+        with open(GROUP_B_PERCENTAGES_FILE, 'w') as f:
+            json.dump(group_b_percentages, f, indent=2)
+            logger.info(f"Saved Group B percentages to file")
+    except Exception as e:
+        logger.error(f"Error saving Group B percentages: {e}")
 
 # Function to load all configuration data
 def load_config_data():
     """Load all configuration data from files."""
-    global GROUP_A_IDS, GROUP_B_IDS, GROUP_ADMINS, FORWARDING_ENABLED
+    global GROUP_A_IDS, GROUP_B_IDS, GROUP_ADMINS, FORWARDING_ENABLED, group_b_percentages
     
     # Load Group A IDs
     if os.path.exists(GROUP_A_IDS_FILE):
@@ -188,6 +201,18 @@ def load_config_data():
                 logger.info(f"Loaded bot settings: forwarding_enabled={FORWARDING_ENABLED}")
         except Exception as e:
             logger.error(f"Error loading bot settings: {e}")
+    
+    # Load Group B Percentages
+    if os.path.exists(GROUP_B_PERCENTAGES_FILE):
+        try:
+            with open(GROUP_B_PERCENTAGES_FILE, 'r') as f:
+                percentages_json = json.load(f)
+                # Convert keys back to integers
+                group_b_percentages = {int(group_id): percentage for group_id, percentage in percentages_json.items()}
+                logger.info(f"Loaded Group B percentages from file: {group_b_percentages}")
+        except Exception as e:
+            logger.error(f"Error loading Group B percentages: {e}")
+            group_b_percentages = {}
 
 # Check if user is a global admin
 def is_global_admin(user_id):
@@ -298,17 +323,36 @@ def start(update: Update, context: CallbackContext) -> None:
 
 def help_command(update: Update, context: CallbackContext) -> None:
     """Send a message when the command /help is issued."""
-    help_text = (
-        "🤖 Bot Commands:\n\n"
-        "🚀 /start - Start the bot\n"
-        "❓ /help - Show this help message\n"
-        "🖼️ /setimage <number> - Set an image with a number (reply to an image)\n"
-        "📋 /images - List all images and their statuses\n"
-        "🔍 /debug - Show bot status\n\n"
-        "👑 Admin functionality:\n"
-        "- Reply to a user's message with the word '群' to send them an image"
-    )
-    update.message.reply_text(help_text)
+    user_id = update.message.from_user.id
+    
+    help_text = """
+🤖 *Telegram Image Management Bot*
+
+*Basic Commands:*
+/start - Start the bot
+/help - Show this help message
+/images - List all images and their statuses
+
+*Admin Commands:*
+/setimage <number> - Set an image with a number (reply to an image)
+
+*How it works:*
+1. Send a number in Group A to get a random open image
+2. The bot forwards the image to Group B
+3. Users in Group B can reopen images with the + button
+"""
+
+    if is_global_admin(user_id):
+        help_text += """
+*Global Admin Commands:*
+/setgroupbpercent <group_b_id> <percentage> - Set percentage chance (0-100) for a Group B
+/resetgroupbpercent - Reset all Group B percentages to normal
+/listgroupbpercent - List all Group B percentage settings
+/debug - Debug information
+/dreset - Reset all image statuses
+"""
+
+    update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
 def set_image(update: Update, context: CallbackContext) -> None:
     """Set an image with a number."""
@@ -516,51 +560,16 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
         # This is a simplified approach - you might want to implement something more robust
         logger.info(f"Multiple Group B chats detected: {GROUP_B_IDS}")
     
-    for attempt in range(max_attempts):
-        # Get a random open image
-        random_image = db.get_random_open_image()
-        if not random_image:
-            update.message.reply_text("No open images available.")
-            return
-        
-        # Get metadata and check if this image is from a specific Group B
-        metadata = random_image.get('metadata', {})
-        logger.info(f"Checking image {random_image['image_id']} metadata: {metadata}")
-        
-        if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
-            try:
-                source_group_b_id = int(metadata['source_group_b_id'])
-                
-                # For each attempt, be more lenient in our criteria
-                if attempt == 0:
-                    # First attempt: Try to match exact Group B if we have a target
-                    if target_group_b and source_group_b_id == target_group_b:
-                        image = random_image
-                        logger.info(f"Found exact matching image {image['image_id']} for Group B {source_group_b_id}")
-                        break
-                elif attempt < 3:
-                    # Later attempts: Accept any image from a valid Group B
-                    if source_group_b_id in GROUP_B_IDS or source_group_b_id == GROUP_B_ID:
-                        image = random_image
-                        logger.info(f"Found image {image['image_id']} from valid Group B {source_group_b_id}")
-                        break
-                else:
-                    # Last attempts: Accept any image with metadata
-                    image = random_image
-                    logger.info(f"Accepting any image with metadata: {image['image_id']}")
-                    break
-            except (ValueError, TypeError) as e:
-                logger.error(f"Error processing metadata for image {random_image['image_id']}: {e}")
-        
-        # If this was the last attempt, use this image regardless
-        if attempt == max_attempts - 1:
-            image = random_image
-            logger.info(f"Using last attempted image: {image['image_id']}")
+    # Use the new ascending order function with percentage support
+    image = db.get_next_open_image_ascending_with_percentage(group_b_percentages)
     
-    # If still no image found, use the last random one we got
     if not image:
-        image = random_image
-        logger.info(f"No suitable image found after {max_attempts} attempts, using random image: {image['image_id']}")
+        # If no image found with percentage constraints, try without constraints
+        image = db.get_next_open_image_ascending()
+        
+    if not image:
+        update.message.reply_text("No open images available.")
+        return
     
     logger.info(f"Selected image: {image['image_id']}")
     
@@ -1929,14 +1938,7 @@ def handle_group_b_reset_images(update: Update, context: CallbackContext) -> Non
     logger.info(f"Found {image_count} images associated with Group B {chat_id}")
     
     # Backup the existing images before deleting
-    backup_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_file = f"images_backup_{backup_time}.json"
-    
-    try:
-        with open(backup_file, 'w') as f:
-            json.dump(group_b_images, f, indent=2)
-        logger.info(f"Backed up {image_count} images for Group B {chat_id} to {backup_file}")
-    except Exception as e:
+    # Backup functionality removed
         logger.error(f"Error backing up images: {e}")
     
     # Delete only images from this Group B
@@ -2130,6 +2132,11 @@ def register_handlers(dispatcher):
     dispatcher.add_handler(CommandHandler("id", get_id_command))
     dispatcher.add_handler(CommandHandler("adminlist", admin_list_command))
     dispatcher.add_handler(CommandHandler("setimagegroup", set_image_group_b))
+    
+    # Group B percentage management commands (for global admins only)
+    dispatcher.add_handler(CommandHandler("setgroupbpercent", handle_set_group_b_percentage))
+    dispatcher.add_handler(CommandHandler("resetgroupbpercent", handle_reset_group_b_percentages))
+    dispatcher.add_handler(CommandHandler("listgroupbpercent", handle_list_group_b_percentages))
     
     # Handler for admin image sending
     dispatcher.add_handler(MessageHandler(
@@ -2539,72 +2546,125 @@ def handle_reset_specific_image(update: Update, context: CallbackContext) -> Non
         logger.error(f"Failed to reset image number {image_number}")
 
 def fix_group_type(update: Update, context: CallbackContext) -> None:
-    """Fix a chat that was accidentally set as both Group A and Group B."""
-    global dispatcher, GROUP_A_IDS, GROUP_B_IDS, GROUP_B_ID
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
+    """Fix group type command for global admins only."""
+    user_id = update.message.from_user.id
     
-    # Check if user is a global admin
     if not is_global_admin(user_id):
-        logger.info(f"User {user_id} tried to fix group type but is not a global admin")
-        update.message.reply_text("只有全局管理员可以修复群聊类型。")
+        update.message.reply_text("⚠️ Only global admins can use this command.")
         return
     
-    # Check if this chat is in both groups
-    in_group_a = int(chat_id) in GROUP_A_IDS or int(chat_id) == GROUP_A_ID
-    in_group_b = int(chat_id) in GROUP_B_IDS or int(chat_id) == GROUP_B_ID
+    try:
+        args = context.args
+        if len(args) < 2:
+            update.message.reply_text("Usage: /fixgrouptype <group_id> <new_type>")
+            return
+        
+        group_id = int(args[0])
+        new_type = args[1].lower()
+        
+        if new_type == 'a':
+            if group_id in GROUP_B_IDS:
+                GROUP_B_IDS.remove(group_id)
+            GROUP_A_IDS.add(group_id)
+            update.message.reply_text(f"✅ Group {group_id} moved to Group A")
+        elif new_type == 'b':
+            if group_id in GROUP_A_IDS:
+                GROUP_A_IDS.remove(group_id)
+            GROUP_B_IDS.add(group_id)
+            update.message.reply_text(f"✅ Group {group_id} moved to Group B")
+        else:
+            update.message.reply_text("❌ Type must be 'a' or 'b'")
+            return
+        
+        save_config_data()
+        
+    except ValueError:
+        update.message.reply_text("❌ Invalid group ID format")
+    except Exception as e:
+        logger.error(f"Error in fix_group_type: {e}")
+        update.message.reply_text("❌ Error fixing group type")
+
+def handle_set_group_b_percentage(update: Update, context: CallbackContext) -> None:
+    """Set percentage chance for a specific Group B to have its images sent to Group A."""
+    user_id = update.message.from_user.id
     
-    if in_group_a and in_group_b:
-        # Remove from Group B
-        if int(chat_id) in GROUP_B_IDS:
-            GROUP_B_IDS.remove(int(chat_id))
-        if int(chat_id) == GROUP_B_ID:
-            GROUP_B_ID = None
-            
-        # Ensure it's in Group A
-        GROUP_A_IDS.add(int(chat_id))
+    if not is_global_admin(user_id):
+        update.message.reply_text("⚠️ Only global admins can use this command.")
+        return
+    
+    try:
+        args = context.args
+        if len(args) != 2:
+            update.message.reply_text("Usage: /setgroupbpercent <group_b_id> <percentage>\nExample: /setgroupbpercent -1002648811668 75")
+            return
         
-        # Save config
+        group_b_id = int(args[0])
+        percentage = int(args[1])
+        
+        if percentage < 0 or percentage > 100:
+            update.message.reply_text("❌ Percentage must be between 0 and 100")
+            return
+        
+        # Check if the group ID is a valid Group B
+        if group_b_id not in GROUP_B_IDS and group_b_id != GROUP_B_ID:
+            update.message.reply_text(f"⚠️ Group ID {group_b_id} is not a registered Group B")
+            return
+        
+        group_b_percentages[group_b_id] = percentage
         save_config_data()
         
-        # Reload handlers
-        if dispatcher:
-            register_handlers(dispatcher)
-            
-        logger.info(f"Fixed chat {chat_id} - removed from Group B, kept in Group A")
-        update.message.reply_text("已修复群聊类型。此群聊现在只属于供方群 (Group A)。")
-    elif in_group_a:
-        update.message.reply_text("此群聊已经是供方群 (Group A)。")
-    elif in_group_b:
-        # Move from Group B to Group A
-        if int(chat_id) in GROUP_B_IDS:
-            GROUP_B_IDS.remove(int(chat_id))
-        if int(chat_id) == GROUP_B_ID:
-            GROUP_B_ID = None
-            
-        # Add to Group A
-        GROUP_A_IDS.add(int(chat_id))
+        update.message.reply_text(f"✅ Set Group B {group_b_id} to {percentage}% chance for image distribution")
+        logger.info(f"Global admin {user_id} set Group B {group_b_id} to {percentage}%")
         
-        # Save config
+    except ValueError:
+        update.message.reply_text("❌ Invalid format. Use: /setgroupbpercent <group_b_id> <percentage>")
+    except Exception as e:
+        logger.error(f"Error in handle_set_group_b_percentage: {e}")
+        update.message.reply_text("❌ Error setting Group B percentage")
+
+def handle_reset_group_b_percentages(update: Update, context: CallbackContext) -> None:
+    """Reset all Group B percentages to normal (no percentage limits)."""
+    user_id = update.message.from_user.id
+    
+    if not is_global_admin(user_id):
+        update.message.reply_text("⚠️ Only global admins can use this command.")
+        return
+    
+    try:
+        global group_b_percentages
+        group_b_percentages.clear()
         save_config_data()
         
-        # Reload handlers
-        if dispatcher:
-            register_handlers(dispatcher)
-            
-        logger.info(f"Changed chat {chat_id} from Group B to Group A")
-        update.message.reply_text("已将群聊从需方群 (Group B) 变更为供方群 (Group A)。")
-    else:
-        # Not in any group, set as Group A
-        GROUP_A_IDS.add(int(chat_id))
-        save_config_data()
+        update.message.reply_text("✅ All Group B percentages have been reset. Image distribution is back to normal.")
+        logger.info(f"Global admin {user_id} reset all Group B percentages")
         
-        # Reload handlers
-        if dispatcher:
-            register_handlers(dispatcher)
-            
-        logger.info(f"Set chat {chat_id} as Group A")
-        update.message.reply_text("已将此群聊设置为供方群 (Group A)。")
+    except Exception as e:
+        logger.error(f"Error in handle_reset_group_b_percentages: {e}")
+        update.message.reply_text("❌ Error resetting Group B percentages")
+
+def handle_list_group_b_percentages(update: Update, context: CallbackContext) -> None:
+    """List all Group B percentage settings."""
+    user_id = update.message.from_user.id
+    
+    if not is_global_admin(user_id):
+        update.message.reply_text("⚠️ Only global admins can use this command.")
+        return
+    
+    try:
+        if not group_b_percentages:
+            update.message.reply_text("📊 No Group B percentage limits are set. All groups have normal distribution.")
+            return
+        
+        message = "📊 Group B Percentage Settings:\n\n"
+        for group_id, percentage in group_b_percentages.items():
+            message += f"Group B {group_id}: {percentage}%\n"
+        
+        message += "\n💡 Groups not listed have normal distribution (100% chance)"
+        update.message.reply_text(message)
+        
+    except Exception as e:
+        logger.error(f"Error in handle_list_group_b_percentages: {e}")
+        update.message.reply_text("❌ Error listing Group B percentages")
 
 if __name__ == '__main__':
     main() 
