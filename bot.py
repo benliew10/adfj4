@@ -1939,7 +1939,6 @@ def handle_group_b_reset_images(update: Update, context: CallbackContext) -> Non
     
     # Backup the existing images before deleting
     # Backup functionality removed
-        logger.error(f"Error backing up images: {e}")
     
     # Delete only images from this Group B
     try:
