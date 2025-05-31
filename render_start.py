@@ -10,10 +10,21 @@ import time
 import signal
 import subprocess
 import atexit
+import requests
 
 def cleanup():
     """Cleanup function called on exit."""
     print("🧹 Performing cleanup...")
+    
+    # Clean up webhook if it was set
+    try:
+        bot_token = os.getenv('BOT_TOKEN')
+        if bot_token:
+            webhook_url = f"https://api.telegram.org/bot{bot_token}/deleteWebhook"
+            requests.post(webhook_url, timeout=10)
+            print("🔗 Webhook cleaned up")
+    except Exception as e:
+        print(f"⚠️  Could not clean webhook: {e}")
 
 def signal_handler(signum, frame):
     """Handle termination signals gracefully."""
@@ -21,21 +32,76 @@ def signal_handler(signum, frame):
     cleanup()
     sys.exit(0)
 
+def clear_telegram_webhook():
+    """Clear any existing Telegram webhook to avoid conflicts."""
+    try:
+        bot_token = os.getenv('BOT_TOKEN')
+        if not bot_token:
+            return False
+            
+        print("🔗 Clearing any existing Telegram webhook...")
+        
+        # Delete webhook
+        webhook_url = f"https://api.telegram.org/bot{bot_token}/deleteWebhook"
+        response = requests.post(webhook_url, timeout=10)
+        
+        if response.status_code == 200:
+            print("✅ Telegram webhook cleared successfully")
+            return True
+        else:
+            print(f"⚠️  Webhook deletion response: {response.status_code}")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Error clearing webhook: {e}")
+        return False
+
+def wait_for_conflict_resolution(max_wait=30):
+    """Wait for any existing bot conflicts to resolve."""
+    print(f"⏳ Waiting up to {max_wait} seconds for any conflicts to resolve...")
+    
+    bot_token = os.getenv('BOT_TOKEN')
+    if not bot_token:
+        return False
+    
+    for i in range(max_wait):
+        try:
+            # Test if we can get updates without conflict
+            test_url = f"https://api.telegram.org/bot{bot_token}/getMe"
+            response = requests.get(test_url, timeout=5)
+            
+            if response.status_code == 200:
+                print(f"✅ Bot API accessible after {i} seconds")
+                return True
+                
+        except Exception as e:
+            pass
+            
+        if i < max_wait - 1:  # Don't sleep on last iteration
+            time.sleep(1)
+    
+    print(f"⚠️  Still potential conflicts after {max_wait} seconds")
+    return False
+
 def find_bot_processes():
     """Find running bot processes (Render-compatible)."""
     try:
+        # In Render, we might not be able to see other container processes
+        # So this is mainly for same-container process detection
         result = subprocess.run(['ps', 'aux'], capture_output=True, text=True)
         bot_pids = []
         
         for line in result.stdout.split('\n'):
             if 'python' in line.lower() and 'bot.py' in line and 'grep' not in line:
-                parts = line.split()
-                if len(parts) > 1:
-                    try:
-                        pid = int(parts[1])
-                        bot_pids.append(pid)
-                    except ValueError:
-                        continue
+                # Exclude our own render_start.py process
+                if 'render_start.py' not in line:
+                    parts = line.split()
+                    if len(parts) > 1:
+                        try:
+                            pid = int(parts[1])
+                            bot_pids.append(pid)
+                        except ValueError:
+                            continue
         
         return bot_pids
     except Exception as e:
@@ -70,7 +136,7 @@ def stop_existing_bots():
             except OSError:
                 pass
     else:
-        print("✅ No existing bot processes found")
+        print("✅ No existing bot processes found in current container")
 
 def main():
     """Main startup function for Render."""
@@ -91,8 +157,14 @@ def main():
     
     print("✅ BOT_TOKEN found")
     
-    # Stop any existing bots
+    # Stop any existing bots in current container
     stop_existing_bots()
+    
+    # Clear Telegram webhook to prevent conflicts with other instances
+    clear_telegram_webhook()
+    
+    # Wait for any conflicts to resolve
+    wait_for_conflict_resolution(15)
     
     # Verify bot.py exists
     if not os.path.exists('bot.py'):
@@ -101,26 +173,53 @@ def main():
     
     print("📂 Found bot.py")
     
-    # Start the bot directly (no subprocess in Render)
+    # Start the bot with retry mechanism
     print("🎯 Starting bot process...")
     
-    try:
-        # Import and run the bot directly instead of subprocess
-        # This works better in Render's container environment
-        import bot
-        print("✅ Bot module imported successfully")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            print(f"🔄 Attempt {attempt + 1}/{max_retries}")
+            
+            # Import and run the bot directly instead of subprocess
+            # This works better in Render's container environment
+            import bot
+            print("✅ Bot module imported successfully")
+            
+            # Run the bot's main function
+            bot.main()
+            
+            # If we reach here, the bot started successfully
+            break
+            
+        except Exception as e:
+            if "Conflict" in str(e) and attempt < max_retries - 1:
+                print(f"⚠️  Conflict detected on attempt {attempt + 1}, retrying...")
+                
+                # Clear webhook again and wait longer
+                clear_telegram_webhook()
+                wait_time = (attempt + 1) * 10  # Exponential backoff
+                print(f"⏳ Waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+                
+                # Reimport the bot module to reset its state
+                if 'bot' in sys.modules:
+                    del sys.modules['bot']
+                
+                continue
+            else:
+                print(f"❌ Error starting bot: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                if attempt == max_retries - 1:
+                    print("💥 All retry attempts failed")
+                    sys.exit(1)
         
-        # Run the bot's main function
-        bot.main()
-        
-    except KeyboardInterrupt:
-        print("🛑 Received keyboard interrupt")
-        cleanup()
-    except Exception as e:
-        print(f"❌ Error starting bot: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        except KeyboardInterrupt:
+            print("🛑 Received keyboard interrupt")
+            cleanup()
+            break
 
 if __name__ == '__main__':
     main() 

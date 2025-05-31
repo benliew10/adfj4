@@ -564,7 +564,7 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
     if not images:
         logger.info("No images found in database - remaining silent")
         return
-    
+        
     # For now, just log that this is a Group A message
     logger.info("Group A message handling completed")
 
