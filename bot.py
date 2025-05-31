@@ -4,8 +4,9 @@ import re
 import json
 import time
 import random
+import threading
 from typing import Dict, Optional, List, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from telegram import Update, ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler
@@ -42,7 +43,7 @@ GLOBAL_ADMINS = set([5962096701, 1844353808, 7997704196, 5965182828])  # Global 
 GROUP_ADMINS = {}  # Format: {chat_id: set(user_ids)} - Group-specific admins
 
 # Message forwarding control
-FORWARDING_ENABLED = True  # Controls if messages can be forwarded from Group B to Group A
+FORWARDING_ENABLED = False  # Controls if messages can be forwarded from Group B to Group A
 
 # Paths for persistent storage
 FORWARDED_MSGS_FILE = "forwarded_msgs.json"
@@ -53,6 +54,7 @@ GROUP_ADMINS_FILE = "group_admins.json"
 PENDING_CUSTOM_AMOUNTS_FILE = "pending_custom_amounts.json"
 SETTINGS_FILE = "bot_settings.json"
 GROUP_B_PERCENTAGES_FILE = "group_b_percentages.json"
+GROUP_B_CLICK_MODE_FILE = "group_b_click_mode.json"
 
 # Message IDs mapping for forwarded messages
 forwarded_msgs: Dict[str, Dict] = {}
@@ -68,6 +70,12 @@ pending_custom_amounts: Dict[int, Dict] = {}  # Format: {message_id: {img_id, am
 
 # Store Group B percentage settings for image distribution
 group_b_percentages: Dict[int, int] = {}  # Format: {group_b_id: percentage}
+
+# Store Group B click mode settings - True means single-click mode, False means default mode
+group_b_click_mode: Dict[int, bool] = {}  # Format: {group_b_id: is_click_mode}
+
+# Store scheduled message deletions
+scheduled_deletions: Dict[str, Any] = {}  # Format: {deletion_id: job_info}
 
 # Function to safely send messages with retry logic
 def safe_send_message(context, chat_id, text, reply_to_message_id=None, max_retries=3, retry_delay=2):
@@ -155,11 +163,19 @@ def save_config_data():
             logger.info(f"Saved Group B percentages to file")
     except Exception as e:
         logger.error(f"Error saving Group B percentages: {e}")
+    
+    # Save Group B Click Mode Settings
+    try:
+        with open(GROUP_B_CLICK_MODE_FILE, 'w') as f:
+            json.dump(group_b_click_mode, f, indent=2)
+            logger.info(f"Saved Group B click mode settings to file")
+    except Exception as e:
+        logger.error(f"Error saving Group B click mode settings: {e}")
 
 # Function to load all configuration data
 def load_config_data():
     """Load all configuration data from files."""
-    global GROUP_A_IDS, GROUP_B_IDS, GROUP_ADMINS, FORWARDING_ENABLED, group_b_percentages
+    global GROUP_A_IDS, GROUP_B_IDS, GROUP_ADMINS, FORWARDING_ENABLED, group_b_percentages, group_b_click_mode
     
     # Load Group A IDs
     if os.path.exists(GROUP_A_IDS_FILE):
@@ -197,7 +213,7 @@ def load_config_data():
         try:
             with open(SETTINGS_FILE, 'r') as f:
                 settings = json.load(f)
-                FORWARDING_ENABLED = settings.get("forwarding_enabled", True)
+                FORWARDING_ENABLED = settings.get("forwarding_enabled", False)
                 logger.info(f"Loaded bot settings: forwarding_enabled={FORWARDING_ENABLED}")
         except Exception as e:
             logger.error(f"Error loading bot settings: {e}")
@@ -213,6 +229,18 @@ def load_config_data():
         except Exception as e:
             logger.error(f"Error loading Group B percentages: {e}")
             group_b_percentages = {}
+    
+    # Load Group B Click Mode Settings
+    if os.path.exists(GROUP_B_CLICK_MODE_FILE):
+        try:
+            with open(GROUP_B_CLICK_MODE_FILE, 'r') as f:
+                click_mode_json = json.load(f)
+                # Convert keys back to integers
+                group_b_click_mode = {int(group_id): is_click_mode for group_id, is_click_mode in click_mode_json.items()}
+                logger.info(f"Loaded Group B click mode settings from file: {group_b_click_mode}")
+        except Exception as e:
+            logger.error(f"Error loading Group B click mode settings: {e}")
+            group_b_click_mode = {}
 
 # Check if user is a global admin
 def is_global_admin(user_id):
@@ -535,112 +563,10 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
     images = db.get_all_images()
     if not images:
         logger.info("No images found in database - remaining silent")
-        # Removed the reply message to remain silent when no images are set
-        return
-        
-    # Count open and closed images
-    open_count, closed_count = db.count_images_by_status()
-    logger.info(f"Images: {len(images)}, Open: {open_count}, Closed: {closed_count}")
-    
-    # If all images are closed, remain silent
-    if open_count == 0 and closed_count > 0:
-        logger.info("All images are closed - remaining silent")
-        return
-
-    # Fix the image selection logic for Group A
-    # Try up to 5 times to get an image for the correct Group B
-    max_attempts = 5
-    image = None
-    
-    # Check if there are any Group B specific images for this request
-    target_group_b = None
-    # If there are multiple Group B chats, try to determine if there's a specific one we should use
-    if len(GROUP_B_IDS) > 1:
-        # Check message content to see if it contains info about target Group B
-        # This is a simplified approach - you might want to implement something more robust
-        logger.info(f"Multiple Group B chats detected: {GROUP_B_IDS}")
-    
-    # Use the new ascending order function with percentage support
-    image = db.get_next_open_image_ascending_with_percentage(group_b_percentages)
-    
-    if not image:
-        # If no image found with percentage constraints, try without constraints
-        image = db.get_next_open_image_ascending()
-        
-    if not image:
-        update.message.reply_text("No open images available.")
         return
     
-    logger.info(f"Selected image: {image['image_id']}")
-    
-    # Send the image
-    try:
-        sent_msg = update.message.reply_photo(
-            photo=image['file_id'],
-            caption=f"🌟 群: {image['number']} 🌟"
-        )
-        logger.info(f"Image sent successfully with message_id: {sent_msg.message_id}")
-        
-        # Forward the content to the appropriate Group B chat
-        try:
-            # Get metadata if available
-            metadata = image.get('metadata', {})
-            logger.info(f"Image metadata: {metadata}")
-            
-            # Get the proper Group B ID for this image - this is the critical part
-            target_group_b_id = get_group_b_for_image(image['image_id'], metadata)
-            logger.info(f"Target Group B ID for forwarding: {target_group_b_id}")
-            
-            # Make EXTRA sure this is a valid Group B ID
-            valid_group_b = False
-            try:
-                target_group_b_id_int = int(target_group_b_id)
-                if target_group_b_id_int in [int(gid) for gid in GROUP_B_IDS] or target_group_b_id_int == int(GROUP_B_ID):
-                    valid_group_b = True
-                else:
-                    logger.error(f"Target Group B ID {target_group_b_id_int} is not valid! Valid IDs: GROUP_B_IDS={GROUP_B_IDS}, GROUP_B_ID={GROUP_B_ID}")
-                    # Fall back to main GROUP_B_ID
-                    target_group_b_id = GROUP_B_ID
-                    logger.info(f"Falling back to main GROUP_B_ID: {GROUP_B_ID}")
-            except (ValueError, TypeError) as e:
-                logger.error(f"Error validating target_group_b_id: {e}")
-                # Fall back to main GROUP_B_ID
-                target_group_b_id = GROUP_B_ID
-                logger.info(f"Falling back to main GROUP_B_ID due to error: {GROUP_B_ID}")
-            
-            # Now we have a consistent target_group_b_id
-            forwarded = context.bot.send_message(
-                chat_id=target_group_b_id,
-                text=f"💰 金额：{amount}\n🔢 群：{image['number']}\n\n❌ 如果会员10分钟没进群请回复0"
-            )
-            
-            # Store mapping between original and forwarded message
-            forwarded_msgs[image['image_id']] = {
-                'group_a_msg_id': sent_msg.message_id,
-                'group_a_chat_id': chat_id,  # Use the actual Group A chat ID that received this message
-                'group_b_msg_id': forwarded.message_id,
-                'group_b_chat_id': target_group_b_id,
-                'image_id': image['image_id'],
-                'amount': amount,  # Store the original amount
-                'number': str(image['number']),  # Store the image number as string
-                'original_user_id': update.message.from_user.id,  # Store original user for more robust tracking
-                'original_message_id': update.message.message_id  # Store the original message ID to reply to
-            }
-            
-            logger.info(f"Stored message mapping: {forwarded_msgs[image['image_id']]}")
-            
-            # Save persistent data
-            save_persistent_data()
-            
-            # Set image status to closed
-            db.set_image_status(image['image_id'], "closed")
-            logger.info(f"Image {image['image_id']} status set to closed")
-        except Exception as e:
-            logger.error(f"Error forwarding to Group B: {e}")
-            update.message.reply_text(f"发送至Group B失败: {e}")
-    except Exception as e:
-        logger.error(f"Error sending image: {e}")
-        update.message.reply_text(f"发送图片错误: {e}")
+    # For now, just log that this is a Group A message
+    logger.info("Group A message handling completed")
 
 def handle_approval(update: Update, context: CallbackContext) -> None:
     """Handle approval messages (reply with '1')."""
@@ -693,9 +619,30 @@ def handle_approval(update: Update, context: CallbackContext) -> None:
             logger.info(f"Image sent to Group A with message_id: {sent_msg.message_id}")
             
             # Then forward to Group B
+            # Check click mode for this Group B
+            click_mode = is_click_mode_enabled(target_group_b_id)
+            
+            # Create buttons based on click mode
+            if click_mode:
+                # Single button mode
+                keyboard = [
+                    [InlineKeyboardButton("解除", callback_data=f"release_{image['image_id']}")]
+                ]
+            else:
+                # Default mode with multiple buttons
+                keyboard = [
+                    [
+                        InlineKeyboardButton(f"+{amount}", callback_data=f"verify_{image['image_id']}_{amount}"),
+                        InlineKeyboardButton("+0", callback_data=f"verify_{image['image_id']}_0")
+                    ]
+                ]
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
             forwarded = context.bot.send_message(
                 chat_id=target_group_b_id,
-                text=f"💰 金额：{amount}\n🔢 群：{image['number']}\n\n❌ 如果会员10分钟没进群请回复0"
+                text=f"💰 金额：{amount}\n🔢 群：{image['number']}\n\n❌ 如果会员10分钟没进群请回复0",
+                reply_markup=reply_markup
             )
             logger.info(f"Message forwarded to Group B with message_id: {forwarded.message_id}")
             
@@ -728,713 +675,6 @@ def handle_approval(update: Update, context: CallbackContext) -> None:
             update.message.reply_text(f"发送至Group B失败: {e}")
     else:
         logger.info(f"No pending request found for message ID: {request_msg_id}")
-
-def handle_all_group_b_messages(update: Update, context: CallbackContext) -> None:
-    """Single handler for ALL messages in Group B"""
-    global FORWARDING_ENABLED
-    chat_id = update.effective_chat.id
-    logger.info(f"Group B message handler received in chat ID: {chat_id}")
-    logger.info(f"GROUP_A_IDS: {GROUP_A_IDS}, GROUP_B_IDS: {GROUP_B_IDS}")
-    logger.info(f"Is chat in Group A: {int(chat_id) in GROUP_A_IDS or int(chat_id) == GROUP_A_ID}")
-    logger.info(f"Is chat in Group B: {int(chat_id) in GROUP_B_IDS or int(chat_id) == GROUP_B_ID}")
-    
-    message_id = update.message.message_id
-    text = update.message.text.strip()
-    user = update.effective_user.username or update.effective_user.first_name
-    user_id = update.effective_user.id
-    
-    # Skip empty messages
-    if not text:
-        return
-    
-    # Special case for "+0" or "0" responses - handle image status but don't send confirmation
-    if (text == "+0" or text == "0") and update.message.reply_to_message:
-        reply_msg_id = update.message.reply_to_message.message_id
-        logger.info(f"Received {text} reply to message {reply_msg_id}")
-        
-        # Find if any known message matches this reply ID
-        for img_id, data in forwarded_msgs.items():
-            if data.get('group_b_msg_id') == reply_msg_id:
-                logger.info(f"Found matching image {img_id} for {text} reply")
-                
-                # Save the Group B response
-                group_b_responses[img_id] = "+0"
-                logger.info(f"Stored Group B response: +0")
-                
-                # Save responses
-                save_persistent_data()
-                
-                # Mark the image as open
-                db.set_image_status(img_id, "open")
-                logger.info(f"Set image {img_id} status to open")
-                
-                # Send response to Group A only if forwarding is enabled
-                if FORWARDING_ENABLED:
-                    if 'group_a_chat_id' in data and 'group_a_msg_id' in data:
-                        try:
-                            # Get the original message ID if available
-                            original_message_id = data.get('original_message_id')
-                            reply_to_message_id = original_message_id if original_message_id else data['group_a_msg_id']
-                            
-                            # Send response back to Group A
-                            safe_send_message(
-                                context=context,
-                                chat_id=data['group_a_chat_id'],
-                                text="会员没进群呢哥哥~ 😢",
-                                reply_to_message_id=reply_to_message_id
-                            )
-                            logger.info(f"Sent +0 response to Group A (translated to '会员没进群呢哥哥~ 😢')")
-                        except Exception as e:
-                            logger.error(f"Error sending +0 response to Group A: {e}")
-                    else:
-                        logger.info("Group A chat ID or message ID not found in data")
-                else:
-                    logger.info("Forwarding to Group A is currently disabled by admin - not sending +0 response")
-                
-                return
-    
-    # Extract all numbers from the message (with or without + prefix)
-    raw_numbers = re.findall(r'\d+', text)
-    plus_numbers = [m[1:] for m in re.findall(r'\+\d+', text)]
-    
-    # Log what we found
-    if raw_numbers:
-        logger.info(f"Found raw numbers: {raw_numbers}")
-    if plus_numbers:
-        logger.info(f"Found numbers with + prefix: {plus_numbers}")
-    
-    # Regular handling for other messages
-    # CASE 1: Check if replying to a message
-    if update.message.reply_to_message:
-        reply_msg_id = update.message.reply_to_message.message_id
-        logger.info(f"This is a reply to message {reply_msg_id}")
-        
-        # Find if any known message matches this reply ID
-        for img_id, data in forwarded_msgs.items():
-            if data.get('group_b_msg_id') == reply_msg_id:
-                logger.info(f"Found matching image {img_id} for this reply")
-                stored_amount = data.get('amount')
-                stored_number = data.get('number')
-                logger.info(f"Expected amount: {stored_amount}, group number: {stored_number}")
-                
-                # If there's a number in the reply with + prefix
-                if plus_numbers:
-                    number = plus_numbers[0]  # Use the first +number
-                    logger.info(f"User provided number: +{number}")
-                    
-                    # Verify the number matches the expected amount
-                    if number == stored_amount:
-                        logger.info(f"Provided number matches the expected amount: {stored_amount}")
-                        process_group_b_response(update, context, img_id, data, number, f"+{number}", "reply_valid_amount")
-                        return
-                    elif number == stored_number:
-                        # Number matches group number but not amount - silently ignore
-                        logger.info(f"Number {number} matches group number but NOT the expected amount {stored_amount}")
-                        return
-                    else:
-                        # Number doesn't match either amount or group number - CUSTOM AMOUNT
-                        logger.info(f"Number {number} is a custom amount, different from {stored_amount}")
-                        # Check if user is a group admin to allow custom amounts
-                        if is_group_admin(user_id, chat_id) or is_global_admin(user_id):
-                            # Handle custom amount that needs approval
-                            handle_custom_amount(update, context, img_id, data, number)
-                            return
-                        else:
-                            logger.info(f"User {user_id} is not an admin, silently ignoring custom amount")
-                            return
-                
-                # If there's a raw number (without +)
-                elif raw_numbers:
-                    number = raw_numbers[0]  # Use the first raw number
-                    logger.info(f"User provided raw number: {number}")
-                    
-                    # Verify the number matches the expected amount
-                    if number == stored_amount:
-                        logger.info(f"Provided number matches the expected amount: {stored_amount}")
-                        process_group_b_response(update, context, img_id, data, number, f"+{number}", "reply_valid_amount_raw")
-                        return
-                    elif number == stored_number:
-                        # Number matches group number but not amount - silently ignore
-                        logger.info(f"Number {number} matches group number but NOT the expected amount {stored_amount}")
-                        return
-                    else:
-                        # Number doesn't match either amount or group number - CUSTOM AMOUNT
-                        logger.info(f"Number {number} is a custom amount, different from {stored_amount}")
-                        # Check if user is a group admin to allow custom amounts
-                        if is_group_admin(user_id, chat_id) or is_global_admin(user_id):
-                            # Handle custom amount that needs approval
-                            handle_custom_amount(update, context, img_id, data, number)
-                            return
-                        else:
-                            logger.info(f"User {user_id} is not an admin, silently ignoring custom amount")
-                            return
-                
-                # No numbers in reply - silently ignore
-                else:
-                    logger.info("Reply without any numbers detected")
-                    return
-        
-        # If replying to a message that's not from our bot
-        logger.info("Reply to a message that's not recognized as one of our bot's messages")
-        return
-    
-    # At this point, the message is not a reply - only proceed for Group B admins and specific commands
-    if "重置群码" in text or "设置群" in text or "设置群聊" in text or "设置操作人" in text or "解散群聊" in text:
-        # These are handled by other message handlers, so let them through
-        logger.info(f"Passing command message to other handlers: {text}")
-        return
-    
-    # For standalone "+number" messages - we now silently ignore them
-    if plus_numbers or (raw_numbers and len(text) <= 10):  # Simple number messages
-        logger.info(f"Received standalone number message: {text}")
-        # Silently ignore standalone number messages
-        logger.info("Silently ignoring standalone number message")
-        return
-    
-    # For any other messages, just log and take no action
-    logger.info("No action taken for this message")
-
-def process_group_b_response(update, context, img_id, msg_data, number, original_text, match_type):
-    """Process a response from Group B and update status."""
-    global FORWARDING_ENABLED
-    responder = update.effective_user.username or update.effective_user.first_name
-    
-    # Simplified response format - just the +number or custom message for +0
-    if number == "0" or original_text == "+0" or original_text == "0":
-        response_text = "会员没进群呢哥哥~ 😢"
-    else:
-        if "+" in original_text:
-            response_text = original_text  # Keep the original format if it already has +
-        else:
-            response_text = f"+{number}"  # Add + if missing
-    
-    logger.info(f"Processing Group B response for image {img_id} (match type: {match_type})")
-    
-    # Save the Group B response for this image
-    group_b_responses[img_id] = response_text
-    logger.info(f"Stored Group B response: {response_text}")
-    
-    # Save responses
-    save_persistent_data()
-    
-    # Set status to open
-    db.set_image_status(img_id, "open")
-    logger.info(f"Set image {img_id} status to open")
-    
-    # Send the response to Group A chat
-    if 'group_a_chat_id' in msg_data and 'group_a_msg_id' in msg_data:
-        if FORWARDING_ENABLED:
-            logger.info(f"Sending response to Group A: {msg_data['group_a_chat_id']}")
-            try:
-                # Get the original message ID if available
-                original_message_id = msg_data.get('original_message_id')
-                reply_to_message_id = original_message_id if original_message_id else msg_data['group_a_msg_id']
-                
-                # Send response back to Group A
-                safe_send_message(
-                    context=context,
-                    chat_id=msg_data['group_a_chat_id'],
-                    text=response_text,
-                    reply_to_message_id=reply_to_message_id
-                )
-                logger.info(f"Successfully sent response to Group A {msg_data['group_a_chat_id']}: {response_text}")
-            except Exception as e:
-                logger.error(f"Error sending response to Group A: {e}")
-                # No error messages to user
-                logger.error("Could not notify user about Group A send failure")
-        else:
-            logger.info("Forwarding to Group A is currently disabled by admin")
-            # No notification message when forwarding is disabled
-    
-    # No confirmation message to Group B
-    logger.info(f"No confirmation sent to Group B for: {response_text}")
-
-# Add handler for replies to bot messages in Group A
-def handle_group_a_reply(update: Update, context: CallbackContext) -> None:
-    """Handle replies to bot messages in Group A silently (no auto-replies)."""
-    # Completely silent handler - no processing, no responses
-    logger.info(f"Reply received in Group A - ignoring silently")
-    return
-    
-    # All the processing below has been commented out to ensure complete silence
-    """
-    chat_id = update.effective_chat.id
-    message_id = update.message.message_id
-    reply_to_message_id = update.message.reply_to_message.message_id if update.message.reply_to_message else None
-    
-    logger.info(f"Reply received in chat {chat_id} to message {reply_to_message_id}")
-    
-    # Check if replying to a message
-    if not update.message.reply_to_message:
-        logger.info("Not a reply to any message")
-        return
-    
-    # Check if replying to a photo message (our bot images have photos)
-    if not update.message.reply_to_message.photo:
-        logger.info("Not replying to a photo message")
-        return
-    
-    logger.info("Reply to photo message detected in Group A")
-    logger.info(f"Current forwarded_msgs: {forwarded_msgs}")
-    
-    # Find the image ID for this message - just log information, don't reply
-    found = False
-    for img_id, msg_data in forwarded_msgs.items():
-        group_a_msg_id = msg_data.get('group_a_msg_id')
-        logger.info(f"Checking image {img_id} with group_a_msg_id: {group_a_msg_id}")
-        
-        # Check if the message IDs match
-        if group_a_msg_id and str(group_a_msg_id) == str(reply_to_message_id):
-            logger.info(f"Found matching image: {img_id}")
-            found = True
-            
-            # Check if there's a response from Group B - just log it
-            if img_id in group_b_responses:
-                response = group_b_responses[img_id]
-                logger.info(f"Group B response for image {img_id}: {response}")
-            else:
-                logger.info(f"No Group B response found for image {img_id}")
-            
-            break
-    
-    if not found:
-        logger.info(f"No matching image found for reply to message {reply_to_message_id}")
-        # No response if no match
-    """
-
-def button_callback(update: Update, context: CallbackContext) -> None:
-    """Handle button callbacks."""
-    global FORWARDING_ENABLED
-    query = update.callback_query
-    query.answer()
-    
-    # Parse callback data
-    data = query.data
-    if data.startswith('plus_'):
-        image_id = data[5:]  # Remove 'plus_' prefix
-        
-        # Find the message data
-        msg_data = None
-        for img_id, data in forwarded_msgs.items():
-            if img_id == image_id:
-                msg_data = data
-                break
-        
-        if msg_data:
-            original_amount = msg_data.get('amount', '0')
-            
-            # Set up inline keyboard for amount verification
-            keyboard = [
-                [
-                    InlineKeyboardButton(f"+{original_amount}", callback_data=f"verify_{image_id}_{original_amount}"),
-                    InlineKeyboardButton("+0", callback_data=f"verify_{image_id}_0")
-                ]
-            ]
-            
-            try:
-                query.edit_message_reply_markup(
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
-                
-                query.message.reply_text(f"请确认金额: +{original_amount} 或 +0（如果会员未进群）")
-            except (NetworkError, TimedOut) as e:
-                logger.error(f"Network error in button callback: {e}")
-    
-    elif data.startswith('verify_'):
-        # Format: verify_image_id_amount
-        parts = data.split('_')
-        if len(parts) >= 3:
-            image_id = parts[1]
-            amount = parts[2]
-            
-            # Find the message data
-            msg_data = None
-            for img_id, data in forwarded_msgs.items():
-                if img_id == image_id:
-                    msg_data = data
-                    break
-            
-            # Simplified response format - just +amount or custom message for +0
-            response_text = "会员没进群呢哥哥~ 😢" if amount == "0" else f"+{amount}"
-            
-            # Store the response for Group A
-            group_b_responses[image_id] = response_text
-            logger.info(f"Stored Group B button response for image {image_id}: {response_text}")
-            
-            # Save updated responses
-            save_persistent_data()
-            
-            try:
-                # Set status to open
-                if db.set_image_status(image_id, "open"):
-                    query.edit_message_reply_markup(None)
-                    
-                # Only send response to Group A if forwarding is enabled
-                if FORWARDING_ENABLED:
-                    if msg_data and 'group_a_chat_id' in msg_data and 'group_a_msg_id' in msg_data:
-                        try:
-                            # Get the original message ID if available
-                            original_message_id = msg_data.get('original_message_id')
-                            reply_to_message_id = original_message_id if original_message_id else msg_data['group_a_msg_id']
-                            
-                            # Send response back to Group A using safe send method
-                            safe_send_message(
-                                context=context,
-                                chat_id=msg_data['group_a_chat_id'],
-                                text=response_text,
-                                reply_to_message_id=reply_to_message_id
-                            )
-                            logger.info(f"Directly sent Group B button response to Group A: {response_text}")
-                        except Exception as e:
-                            logger.error(f"Error sending button response to Group A: {e}")
-                            query.message.reply_text(f"回复已保存，但发送到需方群失败: {e}")
-                else:
-                    logger.info("Forwarding to Group A is currently disabled by admin - not sending button response")
-                    # Remove the notification message
-                    # query.message.reply_text("回复已保存，但转发到需方群功能当前已关闭。")
-            except (NetworkError, TimedOut) as e:
-                logger.error(f"Network error in verify callback: {e}")
-
-def debug_command(update: Update, context: CallbackContext) -> None:
-    """Debug command to display current state."""
-    # Only allow in private chats from admin
-    if update.effective_chat.type != "private" or not is_global_admin(update.effective_user.id):
-        update.message.reply_text("Only global admins can use this command in private chat.")
-        return
-    
-    debug_info = [
-        f"🔹 Group A IDs: {GROUP_A_IDS}",
-        f"🔸 Group B IDs: {GROUP_B_IDS}",
-        f"👥 Group Admins: {GROUP_ADMINS}",
-        f"📨 Forwarded Messages: {len(forwarded_msgs)}",
-        f"📝 Group B Responses: {len(group_b_responses)}",
-        f"🖼️ Images: {len(db.get_all_images())}",
-        f"⚙️ Forwarding Enabled: {FORWARDING_ENABLED}"
-    ]
-    
-    update.message.reply_text("\n".join(debug_info))
-
-def register_admin_command(update: Update, context: CallbackContext) -> None:
-    """Register a user as group admin by user ID."""
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    
-    # Only allow global admins
-    if not is_global_admin(user_id):
-        update.message.reply_text("只有全局管理员可以使用此命令。")
-        return
-    
-    # Check if we have arguments
-    if not context.args or len(context.args) != 1:
-        update.message.reply_text("用法: /admin <user_id> - 将用户设置为群操作人")
-        return
-    
-    # Get the target user ID
-    try:
-        target_user_id = int(context.args[0])
-        
-        # Add the user as group admin
-        add_group_admin(target_user_id, chat_id)
-        
-        update.message.reply_text(f"👤 用户 {target_user_id} A已设置为此群的操作人。")
-        logger.info(f"User {target_user_id} manually added as group admin in chat {chat_id} by admin {user_id}")
-    except ValueError:
-        update.message.reply_text("用户 ID 必须是数字。")
-
-def get_id_command(update: Update, context: CallbackContext) -> None:
-    """Get user and chat IDs."""
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    chat_type = update.effective_chat.type
-    
-    message = f"👤 您的用户 ID: {user_id}\n🌐 群聊 ID: {chat_id}\n📱 群聊类型: {chat_type}"
-    
-    # If replying to someone, get their ID too
-    if update.message.reply_to_message:
-        replied_user_id = update.message.reply_to_message.from_user.id
-        replied_user_name = update.message.reply_to_message.from_user.first_name
-        message += f"\n\n↩️ 回复的用户信息:\n👤 用户 ID: {replied_user_id}\n📝 用户名: {replied_user_name}"
-    
-    update.message.reply_text(message)
-
-def debug_reset_command(update: Update, context: CallbackContext) -> None:
-    """Reset the forwarded_msgs and group_b_responses."""
-    # Only allow in private chats from admin
-    if update.effective_chat.type != "private" or update.effective_user.id not in GLOBAL_ADMINS:
-        update.message.reply_text("Only admins can use this command in private chat.")
-        return
-    
-    global forwarded_msgs, group_b_responses
-    
-    # Backup current data
-    if os.path.exists(FORWARDED_MSGS_FILE):
-        os.rename(FORWARDED_MSGS_FILE, f"{FORWARDED_MSGS_FILE}.bak")
-    
-    if os.path.exists(GROUP_B_RESPONSES_FILE):
-        os.rename(GROUP_B_RESPONSES_FILE, f"{GROUP_B_RESPONSES_FILE}.bak")
-    
-    # Reset dictionaries
-    forwarded_msgs = {}
-    group_b_responses = {}
-    
-    # Save empty data
-    save_persistent_data()
-    
-    update.message.reply_text("🔄 Message mappings and responses have been reset.")
-
-def handle_admin_reply(update: Update, context: CallbackContext) -> None:
-    """Handle admin replies with the word '群'."""
-    user_id = update.effective_user.id
-    
-    # Check if user is an admin
-    if user_id not in GLOBAL_ADMINS:
-        logger.info(f"User {user_id} is not an admin")
-        return
-    
-    # Check if message contains the word '群'
-    if '群' not in update.message.text:
-        return
-    
-    # Check if this is a reply to another message
-    if not update.message.reply_to_message:
-        return
-    
-    logger.info(f"Admin reply detected from user {user_id} with text: {update.message.text}")
-    
-    # Get the original message and user
-    original_message = update.message.reply_to_message
-    original_user_id = original_message.from_user.id
-    original_message_id = original_message.message_id
-    
-    logger.info(f"Original message from user {original_user_id}: {original_message.text}")
-    
-    # Check if we have any images
-    images = db.get_all_images()
-    if not images:
-        logger.info("No images found in database")
-        update.message.reply_text("No images available. Please ask admin to set images.")
-        return
-        
-    # Count open and closed images
-    open_count, closed_count = db.count_images_by_status()
-    logger.info(f"Images: {len(images)}, Open: {open_count}, Closed: {closed_count}")
-    
-    # If all images are closed, remain silent
-    if open_count == 0 and closed_count > 0:
-        logger.info("All images are closed - remaining silent")
-        return
-    
-    # Get a random open image
-    image = db.get_random_open_image()
-    if not image:
-        update.message.reply_text("No open images available.")
-        return
-    
-    logger.info(f"Selected image: {image['image_id']}")
-    
-    # Get amount from original message if it's numeric
-    amount = ""
-    if original_message.text and original_message.text.strip().isdigit():
-        amount = original_message.text.strip()
-    else:
-        # Try to extract numbers from the message
-        numbers = re.findall(r'\d+', original_message.text if original_message.text else "")
-        if numbers:
-            amount = numbers[0]
-        else:
-            amount = "0"  # Default amount if no number found
-    
-    logger.info(f"Extracted amount: {amount}")
-    
-    # Send the image as a reply to the original message
-    try:
-        sent_msg = original_message.reply_photo(
-            photo=image['file_id'],
-            caption=f"Number: {image['number']}"
-        )
-        logger.info(f"Image sent successfully to Group A with message_id: {sent_msg.message_id}")
-        
-        # Forward the content to Group B
-        try:
-            if GROUP_B_ID:
-                logger.info(f"Forwarding to Group B: {GROUP_B_ID}")
-                forwarded = context.bot.send_message(
-                    chat_id=GROUP_B_ID,
-                    text=f"💰 金额：{amount}\n🔢 群：{image['number']}\n\n❌ 如果会员10分钟没进群请回复0"
-                )
-                logger.info(f"Message forwarded to Group B with message_id: {forwarded.message_id}")
-                
-                # Store mapping between original and forwarded message
-                forwarded_msgs[image['image_id']] = {
-                    'group_a_msg_id': sent_msg.message_id,
-                    'group_a_chat_id': update.effective_chat.id,
-                    'group_b_msg_id': forwarded.message_id,
-                    'group_b_chat_id': GROUP_B_ID,
-                    'image_id': image['image_id'],
-                    'amount': amount,  # Store the original amount
-                    'number': str(image['number']),  # Store the image number as string
-                    'original_user_id': original_user_id,  # Store original user for more robust tracking
-                    'original_message_id': original_message_id  # Store the original message ID to reply to
-                }
-                
-                logger.info(f"Stored message mapping: {forwarded_msgs[image['image_id']]}")
-                
-                # Save the updated mappings
-                save_persistent_data()
-                
-                # Set image status to closed
-                db.set_image_status(image['image_id'], "closed")
-                logger.info(f"Image {image['image_id']} status set to closed")
-        except Exception as e:
-            logger.error(f"Error forwarding to Group B: {e}")
-            update.message.reply_text(f"Error forwarding to Group B: {e}")
-    except Exception as e:
-        logger.error(f"Error sending image: {e}")
-        update.message.reply_text(f"Error sending image: {e}")
-
-def handle_general_group_b_message(update: Update, context: CallbackContext) -> None:
-    """Fallback handler for any text message in Group B."""
-    chat_id = update.effective_chat.id
-    message_id = update.message.message_id
-    text = update.message.text.strip()
-    user = update.effective_user.username or update.effective_user.first_name
-    
-    logger.info(f"General handler received: '{text}' from {user} (msg_id: {message_id})")
-    
-    # Extract numbers from text
-    numbers = re.findall(r'\d+', text)
-    if not numbers:
-        logger.info("No numbers found in message, ignoring")
-        return
-    
-    logger.info(f"Extracted numbers: {numbers}")
-    
-    # Try with each extracted number
-    for number in numbers:
-        # 1. FIRST APPROACH: Try to find match by reply
-        if update.message.reply_to_message:
-            reply_msg_id = update.message.reply_to_message.message_id
-            logger.info(f"Message is a reply to message_id: {reply_msg_id}")
-            
-            # Look for the image that corresponds to this reply
-            for img_id, msg_data in forwarded_msgs.items():
-                if msg_data.get('group_b_msg_id') == reply_msg_id:
-                    logger.info(f"Found matching image by reply: {img_id}")
-                    
-                    # Create appropriate text with + if needed
-                    response_text = f"+{number}" if "+" not in text else text
-                    
-                    # Process this message
-                    process_group_b_response(update, context, img_id, msg_data, number, response_text, "general_reply")
-                    return
-        
-        # 2. SECOND APPROACH: Try to find match by number
-        for img_id, msg_data in forwarded_msgs.items():
-            amount = msg_data.get('amount')
-            group_num = msg_data.get('number')
-            
-            logger.info(f"Checking image {img_id}: amount={amount}, number={group_num}")
-            
-            if number == amount:
-                logger.info(f"Found match by amount: {img_id}")
-                
-                # Create appropriate text with + if needed
-                response_text = f"+{number}" if "+" not in text else text
-                
-                process_group_b_response(update, context, img_id, msg_data, number, response_text, "general_amount")
-                return
-            
-            if number == group_num:
-                logger.info(f"Found match by group number: {img_id}")
-                
-                # Create appropriate text with + if needed
-                response_text = f"+{number}" if "+" not in text else text
-                
-                process_group_b_response(update, context, img_id, msg_data, number, response_text, "general_group_number")
-                return
-    
-    # 3. FALLBACK: Just try the most recent message if the message has only one number
-    if len(numbers) == 1 and forwarded_msgs:
-        number = numbers[0]
-        
-        # Sort by recency (assuming newer messages have higher IDs)
-        recent_msgs = sorted(forwarded_msgs.items(), 
-                             key=lambda x: x[1].get('group_b_msg_id', 0), 
-                             reverse=True)
-        
-        if recent_msgs:
-            img_id, msg_data = recent_msgs[0]
-            logger.info(f"No match found, using most recent message: {img_id}")
-            
-            # Create appropriate text with + if needed
-            response_text = f"+{number}" if "+" not in text else text
-            
-            process_group_b_response(update, context, img_id, msg_data, number, response_text, "general_recent")
-            return
-    
-    # If nothing matches, just ignore the message
-    logger.info("No matches found for this message")
-
-# Update forward_message_to_group_b function to use consistent mapping
-def forward_message_to_group_b(update: Update, context: CallbackContext, img_id, amount, number) -> None:
-    """Forward a message from Group A to Group B."""
-    chat_id = update.effective_chat.id
-    message_id = update.message.message_id
-    
-    logger.info(f"Forwarding to Group B - img_id: {img_id}, amount: {amount}, number: {number}")
-    
-    # Check if it's in the format we're expecting
-    if not all([img_id, amount, number]):
-        logger.error("Missing required parameters for forwarding")
-        return
-    
-    try:
-        # Get image from database
-        image = db.get_image_by_id(img_id)
-        if not image:
-            logger.error(f"No image found for ID {img_id}")
-            return
-        
-        # Get the metadata
-        metadata = image.get('metadata', {})
-        
-        # Get consistent Group B for this image
-        target_group_b_id = get_group_b_for_image(img_id, metadata)
-        
-        # Construct caption
-        message_text = f"💰 金额: {amount} 🔢 群: {number}\n\n❌ 如果会员10分钟没进群请回复0"
-        
-        # Send text message instead of photo
-        forwarded = context.bot.send_message(
-            chat_id=target_group_b_id,
-            text=message_text
-        )
-        
-        logger.info(f"Forwarded message for image {img_id} to Group B {target_group_b_id}")
-        
-        # Store the mapping
-        forwarded_msgs[img_id] = {
-            'group_a_chat_id': chat_id,
-            'group_a_msg_id': message_id,
-            'group_b_chat_id': target_group_b_id,
-            'group_b_msg_id': forwarded.message_id,
-            'image_id': img_id,
-            'amount': amount,
-            'number': number,
-            'original_user_id': update.effective_user.id,
-            'original_message_id': message_id
-        }
-        
-        # Save the mapping
-        save_persistent_data()
-        
-        # Mark the image as closed
-        db.set_image_status(img_id, "closed")
-        logger.info(f"Image {img_id} status set to closed")
-        
-    except Exception as e:
-        logger.error(f"Error forwarding to Group B: {e}")
-        update.message.reply_text(f"Error forwarding to Group B: {e}")
 
 def handle_set_group_a(update: Update, context: CallbackContext) -> None:
     """Handle setting a group as Group A."""
@@ -2114,8 +1354,8 @@ def error_handler(update, context):
         logger.error(f"Network error: {context.error}")
 
 def register_handlers(dispatcher):
-    """Register all message handlers. Called at startup and when groups change."""
-    # Clear existing handlers first - use proper way to clear handlers
+    """Register all message handlers."""
+    # Clear existing handlers first
     for group in list(dispatcher.handlers.keys()):
         dispatcher.handlers[group].clear()
     
@@ -2124,108 +1364,18 @@ def register_handlers(dispatcher):
     dispatcher.add_handler(CommandHandler("help", help_command))
     dispatcher.add_handler(CommandHandler("setimage", set_image))
     dispatcher.add_handler(CommandHandler("images", list_images))
-    dispatcher.add_handler(CommandHandler("debug", debug_command))
-    dispatcher.add_handler(CommandHandler("debug_metadata", debug_metadata))
-    dispatcher.add_handler(CommandHandler("dreset", debug_reset_command))
-    dispatcher.add_handler(CommandHandler("admin", register_admin_command))
-    dispatcher.add_handler(CommandHandler("id", get_id_command))
-    dispatcher.add_handler(CommandHandler("adminlist", admin_list_command))
-    dispatcher.add_handler(CommandHandler("setimagegroup", set_image_group_b))
     
-    # Group B percentage management commands (for global admins only)
-    dispatcher.add_handler(CommandHandler("setgroupbpercent", handle_set_group_b_percentage))
-    dispatcher.add_handler(CommandHandler("resetgroupbpercent", handle_reset_group_b_percentages))
-    dispatcher.add_handler(CommandHandler("listgroupbpercent", handle_list_group_b_percentages))
-    
-    # Handler for admin image sending
-    dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^发图'),
-        handle_admin_send_image,
-        run_async=True
-    ))
-    
-    # Handler for setting groups
-    dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^设置群聊A$'),
-        handle_set_group_a,
-        run_async=True
-    ))
-    
-    dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^设置群聊B$'),
-        handle_set_group_b,
-        run_async=True
-    ))
-    
-    # Handler for dissolving group settings
-    dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^解散群聊$'),
-        handle_dissolve_group,
-        run_async=True
-    ))
-    
-    # Handler for promoting group admins
-    dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^设置操作人$') & Filters.reply,
-        handle_promote_group_admin,
-        run_async=True
-    ))
-    
-    # Handler for setting images in Group B
-    dispatcher.add_handler(MessageHandler(
-        Filters.photo & Filters.caption_regex(r'设置群\s*\d+'),
-        handle_set_group_image,
-        run_async=True
-    ))
-    
-    # 1. Handle button callbacks (highest priority)
+    # Add button callback handler (highest priority)
     dispatcher.add_handler(CallbackQueryHandler(button_callback))
     
-    # 2. Add handler for resetting all images in Group B - moved to higher priority
+    # Add handler for "设置点击模式" command
     dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^重置群码$') & (Filters.chat(GROUP_B_ID) | Filters.chat(list(GROUP_B_IDS))),
-        handle_group_b_reset_images,
+        Filters.text & Filters.regex(r'^设置点击模式$') & (Filters.chat(GROUP_B_ID) | Filters.chat(list(GROUP_B_IDS))),
+        handle_set_click_mode,
         run_async=True
     ))
     
-    # 3. Add handler for resetting a specific image by number
-    dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^重置群\d+$') & (Filters.chat(GROUP_B_ID) | Filters.chat(list(GROUP_B_IDS))),
-        handle_reset_specific_image,
-        run_async=True
-    ))
-    
-    # 4. Add handler for custom amount approval
-    dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.regex(r'^(同意|确认)$') & Filters.reply,
-        handle_custom_amount_approval,
-        run_async=True
-    ))
-    
-    # 5. Group B message handling - single handler for everything
-    # Updated to support multiple Group B chats
-    dispatcher.add_handler(MessageHandler(
-        Filters.text & (Filters.chat(GROUP_B_ID) | Filters.chat(list(GROUP_B_IDS))),
-        handle_all_group_b_messages,
-        run_async=True
-    ))
-    
-    # 6. Group A message handling
-    # First admin replies with '群'
-    dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.reply & Filters.regex(r'^群$'),
-        handle_admin_reply,
-        run_async=True
-    ))
-    
-    # Then replies to bot messages in Group A
-    dispatcher.add_handler(MessageHandler(
-        Filters.text & Filters.reply & (Filters.chat(GROUP_A_ID) | Filters.chat(list(GROUP_A_IDS))),
-        handle_group_a_reply,
-        run_async=True
-    ))
-    
-    # Simple number messages in Group A (Updated to support all formats)
+    # Handle Group A messages
     dispatcher.add_handler(MessageHandler(
         Filters.text & 
         ~Filters.regex(r'^\+') &  # Exclude messages starting with +
@@ -2234,29 +1384,14 @@ def register_handlers(dispatcher):
         run_async=True
     ))
     
-    # Add error handler
-    dispatcher.add_error_handler(error_handler)
-    
-    logger.info(f"Handlers registered with Group A IDs: {GROUP_A_IDS}, Group B IDs: {GROUP_B_IDS}")
-    
-    # Handler for toggling forwarding status - works in any chat for global admins
+    # Handle Group B messages
     dispatcher.add_handler(MessageHandler(
-        Filters.text & (Filters.regex(r'^开启转发$') | Filters.regex(r'^关闭转发$') | Filters.regex(r'^转发状态$')),
-        handle_toggle_forwarding,
+        Filters.text & (Filters.chat(GROUP_B_ID) | Filters.chat(list(GROUP_B_IDS))),
+        handle_all_group_b_messages,
         run_async=True
     ))
     
-    # Add commands for forwarding control in private chat
-    dispatcher.add_handler(CommandHandler("forwarding_on", handle_toggle_forwarding, Filters.chat_type.private))
-    dispatcher.add_handler(CommandHandler("forwarding_off", handle_toggle_forwarding, Filters.chat_type.private))
-    dispatcher.add_handler(CommandHandler("forwarding_status", handle_toggle_forwarding, Filters.chat_type.private))
-    
-    # Set chat type commands
-    dispatcher.add_handler(CommandHandler("set_group_a", handle_set_group_a))
-    dispatcher.add_handler(CommandHandler("set_group_b", handle_set_group_b))
-    
-    # Fix group type command
-    dispatcher.add_handler(CommandHandler("fix_group_type", fix_group_type))
+    logger.info(f"Handlers registered with Group A IDs: {GROUP_A_IDS}, Group B IDs: {GROUP_B_IDS}")
 
 def main() -> None:
     """Start the bot."""
@@ -2270,13 +1405,8 @@ def main() -> None:
     load_persistent_data()
     load_config_data()  # Make sure to load configuration data as well
     
-    # Create the Updater and pass it your bot's token with more generous timeouts
-    request_kwargs = {
-        'read_timeout': 60,        # Increased from 30
-        'connect_timeout': 60,     # Increased from 30
-        'con_pool_size': 10,       # Default is 1, increasing for better parallelism
-    }
-    updater = Updater(TOKEN, request_kwargs=request_kwargs)
+    # Create the Updater
+    updater = Updater(TOKEN)
     
     # Get the dispatcher to register handlers
     dispatcher = updater.dispatcher
@@ -2664,6 +1794,282 @@ def handle_list_group_b_percentages(update: Update, context: CallbackContext) ->
     except Exception as e:
         logger.error(f"Error in handle_list_group_b_percentages: {e}")
         update.message.reply_text("❌ Error listing Group B percentages")
+
+# Click mode management functions
+def is_click_mode_enabled(group_b_id):
+    """Check if click mode is enabled for a specific Group B."""
+    return group_b_click_mode.get(int(group_b_id), False)
+
+def set_click_mode(group_b_id, enabled):
+    """Set click mode for a specific Group B."""
+    group_b_click_mode[int(group_b_id)] = enabled
+    save_config_data()
+    logger.info(f"Set click mode for Group B {group_b_id} to {enabled}")
+
+# Message deletion scheduling functions
+def schedule_message_deletion(context, chat_id, message_id, delay_seconds=60):
+    """Schedule a message to be deleted after a delay."""
+    def delete_message():
+        try:
+            time.sleep(delay_seconds)
+            context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            logger.info(f"Auto-deleted message {message_id} in chat {chat_id} after {delay_seconds} seconds")
+        except Exception as e:
+            logger.error(f"Error deleting message {message_id} in chat {chat_id}: {e}")
+    
+    # Run deletion in a separate thread
+    deletion_thread = threading.Thread(target=delete_message)
+    deletion_thread.daemon = True
+    deletion_thread.start()
+    
+    deletion_id = f"{chat_id}_{message_id}_{int(time.time())}"
+    scheduled_deletions[deletion_id] = {
+        'chat_id': chat_id,
+        'message_id': message_id,
+        'scheduled_time': datetime.now() + timedelta(seconds=delay_seconds),
+        'thread': deletion_thread
+    }
+    logger.info(f"Scheduled deletion for message {message_id} in chat {chat_id} after {delay_seconds} seconds")
+    return deletion_id
+
+def cancel_scheduled_deletion(deletion_id):
+    """Cancel a scheduled message deletion if possible."""
+    if deletion_id in scheduled_deletions:
+        # Note: We can't actually stop a thread that's sleeping, but we can remove it from tracking
+        del scheduled_deletions[deletion_id]
+        logger.info(f"Cancelled scheduled deletion {deletion_id}")
+        return True
+    return False
+
+def handle_set_click_mode(update: Update, context: CallbackContext) -> None:
+    """Handle setting click mode for Group B."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Check if this is Group B
+    if chat_id not in GROUP_B_IDS and chat_id != GROUP_B_ID:
+        logger.info(f"Click mode command used in non-Group B chat: {chat_id}")
+        return
+    
+    # Check if user is a group admin or global admin
+    if not is_group_admin(user_id, chat_id) and not is_global_admin(user_id):
+        logger.info(f"User {user_id} tried to set click mode but is not an admin")
+        update.message.reply_text("只有群操作人或全局管理员可以设置点击模式。")
+        return
+    
+    # Toggle click mode
+    current_mode = is_click_mode_enabled(chat_id)
+    new_mode = not current_mode
+    set_click_mode(chat_id, new_mode)
+    
+    if new_mode:
+        update.message.reply_text("✅ 已开启点击模式 - 消息将显示单个按钮，点击后图片状态变为开启并在1分钟后自动删除消息")
+    else:
+        update.message.reply_text("✅ 已关闭点击模式 - 消息将显示默认按钮，图片状态变为开启后在1分钟后自动删除消息")
+    
+    logger.info(f"Admin {user_id} set click mode for Group B {chat_id} to {new_mode}")
+
+def handle_all_group_b_messages(update: Update, context: CallbackContext) -> None:
+    """Handle all messages in Group B."""
+    # Add debug logging
+    chat_id = update.effective_chat.id
+    logger.info(f"Received message in chat ID: {chat_id}")
+    logger.info(f"GROUP_A_IDS: {GROUP_A_IDS}, GROUP_B_IDS: {GROUP_B_IDS}")
+    logger.info(f"Is chat in Group A: {int(chat_id) in GROUP_A_IDS or int(chat_id) == GROUP_A_ID}")
+    logger.info(f"Is chat in Group B: {int(chat_id) in GROUP_B_IDS or int(chat_id) == GROUP_B_ID}")
+    
+    # Check if this chat is a Group B - ensure we're comparing integers
+    if int(chat_id) not in GROUP_B_IDS and int(chat_id) != GROUP_B_ID:
+        logger.info(f"Message received in non-Group B chat: {chat_id}")
+        return
+    
+    # Get message text
+    text = update.message.text.strip()
+    logger.info(f"Received message: {text}")
+    
+    # Skip messages that start with "+"
+    if text.startswith("+"):
+        logger.info("Message starts with '+', skipping")
+        return
+    
+    # Match any of the formats:
+    # - Just a number
+    # - number+群 or number 群
+    # - 群+number or 群 number
+    # - 微信+number or 微信 number 
+    # - number+微信 or number 微信
+    # - 微信群+number or 微信群 number
+    # - number+微信群 or number 微信群
+    patterns = [
+        r'^(\d+)$',  # Just a number
+        r'^(\d+)\s*群$',  # number+群
+        r'^群\s*(\d+)$',  # 群+number
+        r'^微信\s*(\d+)$',  # 微信+number
+        r'^(\d+)\s*微信$',  # number+微信
+        r'^微信群\s*(\d+)$',  # 微信群+number
+        r'^(\d+)\s*微信群$',  # number+微信群
+        r'^微信\s*群\s*(\d+)$',  # 微信 群 number (with spaces)
+        r'^(\d+)\s*微信\s*群$'   # number 微信 群 (with spaces)
+    ]
+    
+    amount = None
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            amount = match.group(1)
+            logger.info(f"Matched pattern '{pattern}' with amount: {amount}")
+            break
+    
+    if not amount:
+        logger.info("Message doesn't match any accepted format")
+        return
+    
+    # Check if the number is between 20 and 5000 (inclusive)
+    try:
+        amount_int = int(amount)
+        if amount_int < 20 or amount_int > 5000:
+            logger.info(f"Number {amount} is outside the allowed range (20-5000).")
+            return
+    except ValueError:
+        logger.info(f"Invalid number format: {amount}")
+        return
+    
+    # Rest of the function remains unchanged
+    # Check if we have any images
+    images = db.get_all_images()
+    if not images:
+        logger.info("No images found in database - remaining silent")
+        return
+    
+    # For now, just log that this is a Group B message
+    logger.info("Group B message handling completed")
+
+def button_callback(update: Update, context: CallbackContext) -> None:
+    """Handle button callbacks."""
+    global FORWARDING_ENABLED
+    query = update.callback_query
+    query.answer()
+    
+    # Parse callback data
+    data = query.data
+    
+    if data.startswith('release_'):
+        # Single-click mode release button
+        image_id = data[8:]  # Remove 'release_' prefix
+        
+        # Find the message data
+        msg_data = None
+        for img_id, data in forwarded_msgs.items():
+            if img_id == image_id:
+                msg_data = data
+                break
+        
+        if msg_data:
+            original_amount = msg_data.get('amount', '0')
+            
+            # Process as if they clicked the amount button
+            response_text = f"+{original_amount}"
+            
+            # Store the response for Group A
+            group_b_responses[image_id] = response_text
+            logger.info(f"Stored Group B release response for image {image_id}: {response_text}")
+            
+            # Save updated responses
+            save_persistent_data()
+            
+            try:
+                # Set status to open
+                if db.set_image_status(image_id, "open"):
+                    # Update button to show "已解除状态"
+                    keyboard = [
+                        [InlineKeyboardButton("已解除状态", callback_data=f"released_{image_id}")]
+                    ]
+                    query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+                    
+                    # Schedule message deletion after 1 minute
+                    schedule_message_deletion(context, query.message.chat_id, query.message.message_id, 60)
+                
+                # Only send response to Group A if forwarding is enabled
+                if FORWARDING_ENABLED:
+                    if msg_data and 'group_a_chat_id' in msg_data and 'group_a_msg_id' in msg_data:
+                        try:
+                            # Get the original message ID if available
+                            original_message_id = msg_data.get('original_message_id')
+                            reply_to_message_id = original_message_id if original_message_id else msg_data['group_a_msg_id']
+                            
+                            # Send response back to Group A using safe send method
+                            safe_send_message(
+                                context=context,
+                                chat_id=msg_data['group_a_chat_id'],
+                                text=response_text,
+                                reply_to_message_id=reply_to_message_id
+                            )
+                            logger.info(f"Sent release response to Group A: {response_text}")
+                        except Exception as e:
+                            logger.error(f"Error sending release response to Group A: {e}")
+                else:
+                    logger.info("Forwarding to Group A is currently disabled by admin - not sending release response")
+            except (NetworkError, TimedOut) as e:
+                logger.error(f"Network error in release callback: {e}")
+    
+    elif data.startswith('released_'):
+        # Button already released, do nothing or show info
+        query.answer("状态已解除", show_alert=False)
+    
+    elif data.startswith('verify_'):
+        # Format: verify_image_id_amount
+        parts = data.split('_')
+        if len(parts) >= 3:
+            image_id = parts[1]
+            amount = parts[2]
+            
+            # Find the message data
+            msg_data = None
+            for img_id, data in forwarded_msgs.items():
+                if img_id == image_id:
+                    msg_data = data
+                    break
+            
+            # Simplified response format - just +amount or custom message for +0
+            response_text = "会员没进群呢哥哥~ 😢" if amount == "0" else f"+{amount}"
+            
+            # Store the response for Group A
+            group_b_responses[image_id] = response_text
+            logger.info(f"Stored Group B button response for image {image_id}: {response_text}")
+            
+            # Save updated responses
+            save_persistent_data()
+            
+            try:
+                # Set status to open
+                if db.set_image_status(image_id, "open"):
+                    query.edit_message_reply_markup(None)
+                    
+                    # Schedule message deletion after 1 minute
+                    schedule_message_deletion(context, query.message.chat_id, query.message.message_id, 60)
+                
+                # Only send response to Group A if forwarding is enabled
+                if FORWARDING_ENABLED:
+                    if msg_data and 'group_a_chat_id' in msg_data and 'group_a_msg_id' in msg_data:
+                        try:
+                            # Get the original message ID if available
+                            original_message_id = msg_data.get('original_message_id')
+                            reply_to_message_id = original_message_id if original_message_id else msg_data['group_a_msg_id']
+                            
+                            # Send response back to Group A using safe send method
+                            safe_send_message(
+                                context=context,
+                                chat_id=msg_data['group_a_chat_id'],
+                                text=response_text,
+                                reply_to_message_id=reply_to_message_id
+                            )
+                            logger.info(f"Directly sent Group B button response to Group A: {response_text}")
+                        except Exception as e:
+                            logger.error(f"Error sending button response to Group A: {e}")
+                else:
+                    logger.info("Forwarding to Group A is currently disabled by admin - not sending button response")
+            except (NetworkError, TimedOut) as e:
+                logger.error(f"Network error in verify callback: {e}")
 
 if __name__ == '__main__':
     main() 
